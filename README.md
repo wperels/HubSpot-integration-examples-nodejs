@@ -12,4 +12,4 @@ This repository contains a number of sample applications
 ##Requirements
 - Node.js 18 or later (the app uses the built-in `fetch`)
 - A HubSpot service key with appropriate scopes 
-    (store in .env file make sure it is include in .gtignore)
+    (store in .env file make sure it is included in .gtignore)
