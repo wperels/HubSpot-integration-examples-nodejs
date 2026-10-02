@@ -7,3 +7,9 @@ This repository contains a number of sample applications
  - [Webhooks API demo application](https://github.com/HubSpot/integration-examples-nodejs/tree/master/webhooks-app)
  - [File Upload demo application](https://github.com/HubSpot/integration-examples-nodejs/tree/master/wrapper-file-upload-app)
  - [Form submission and File Download application](https://github.com/HubSpot/integration-examples-nodejs/tree/master/form-file-submission-access-app)
+
+
+##Requirements
+- Node.js 18 or later (the app uses the built-in `fetch`)
+- A HubSpot service key with appropriate scopes 
+    (store in .env file make sure it is include in .gtignore)
