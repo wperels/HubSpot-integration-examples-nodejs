@@ -4,230 +4,166 @@ require('csv-express');
 const _ = require('lodash');
 const path = require('path');
 const express = require('express');
-const Hubspot = require('hubspot');
 const bodyParser = require('body-parser');
-
 
 const PORT = 3000;
 const CONTACTS_COUNT = 10;
-const CONTACT_OBJECT_TYPE = 'CONTACT';
+const BASE_URL = 'https://api.hubapi.com';
+const LIST_PROPS = ['firstname', 'lastname', 'company', 'email'];
+const NOTE_TO_CONTACT = 202;
 
+const hs = async (method, apiPath, body) => {
+  const res = await fetch(`${BASE_URL}${apiPath}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.HUBSPOT_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) {
+    throw new Error(`HubSpot ${res.status} ${method} ${apiPath}: ${data.message || text}`);
+  }
+  return data;
+};
 
 const checkEnv = (req, res, next) => {
   if (_.startsWith(req.url, '/error')) return next();
-  if (_.isNil(process.env.HUBSPOT_API_KEY)) return res.redirect('/error?msg=Please set HUBSPOT_API_KEY env variable to proceed');
-
+  if (_.isNil(process.env.HUBSPOT_API_KEY)) {
+    return res.redirect('/error?msg=Please set HUBSPOT_API_KEY env variable to proceed');
+  }
   next();
 };
 
-const prepareContactsContent = (contacts) => {
-  return _.map(contacts, (contact) => {
-    const companyName = _.get(contact, 'properties.company.value') || '';
-    return {vid: contact.vid, name: getFullName(contact.properties), companyName}
-  });
+const getFullName = (props) => {
+  const first = _.get(props, 'firstname') || '';
+  const last = _.get(props, 'lastname') || '';
+  return `${first} ${last}`;
 };
 
-const toDate = (value) => {
-  return _.isNil(value) ? null : (new Date(value)).getTime();
+const prepareContactsContent = (contacts) =>
+  _.map(contacts, (c) => ({
+    vid: c.id,
+    name: getFullName(c.properties),
+    companyName: _.get(c, 'properties.company') || '',
+  }));
+
+const isReadOnly = (p) => _.get(p, 'modificationMetadata.readOnlyValue') || p.calculated;
+const isMutable = (p) => _.get(p, 'modificationMetadata.readOnlyDefinition');
+
+const getEditableProperties = (properties) =>
+  _.reduce(properties, (acc, p) => {
+    if (!isReadOnly(p)) acc[p.name] = {name: p.name, label: p.label};
+    return acc;
+  }, {});
+
+const getMutableProperties = (properties) =>
+  _.reduce(properties, (acc, p) => {
+    if (!isMutable(p)) acc[p.name] = p;
+    return acc;
+  }, {});
+
+const getContactEditableProperties = (contactProps, editable) =>
+  _.reduce(editable, (acc, prop, name) => {
+    acc[name] = {...prop};
+    if (!_.isNil(contactProps[name])) acc[name].value = contactProps[name];
+    return acc;
+  }, {});
+
+const getPropertyDetails = (p = {}) => ({
+  name: {label: 'Name', value: p.name},
+  label: {label: 'Label', value: p.label},
+  description: {label: 'Description', value: p.description},
+  groupName: {label: 'Group Name', value: p.groupName},
+  type: {label: 'Type', value: p.type},
+});
+
+const FIELD_TYPES = {
+  string: 'text', number: 'number', date: 'date',
+  datetime: 'date', enumeration: 'select', bool: 'booleancheckbox',
 };
 
-const prepareEngagements = (engagements) => {
-  return _.map(engagements, (engagementDetails) => {
-    const details = _.pick(engagementDetails.engagement, ['id', 'type']);
-    details.title = _.get(engagementDetails, 'metadata.title') || '';
-    console.log(details);
-    return details;
-  });
-};
+const toCsv = (contacts, properties) =>
+  _.map(contacts, (c) =>
+    _.reduce(properties, (row, p) => {
+      row[p.label] = _.get(c, ['properties', p.name]) || '';
+      return row;
+    }, {}));
 
-const getEditableProperties = (properties) => {
-  return _.reduce(properties, (editableProps, property) => {
-    if (!isReadOnly(property)) editableProps[property.name] = {name: property.name, label: property.label};
-    return editableProps
-  }, {})
-};
-
-const getMutableProperties = (properties) => {
-  return _.reduce(properties, (mutableProps, property) => {
-    if (!isMutable(property)) mutableProps[property.name] = property;
-    return mutableProps
-  }, {})
-};
-
-const getContactEditableProperties = (contactProperties, editableProperties) => {
-  return _.reduce(editableProperties, (contactEditableProperties, property, propertyName) => {
-    contactEditableProperties[propertyName] = property;
-    const contactProperty = contactProperties[propertyName];
-    if (contactProperty) contactEditableProperties[propertyName].value = contactProperty.value;
-
-    return contactEditableProperties;
-  }, {})
-};
-
-const getFullName = (contactProperties) => {
-  const firstName = _.get(contactProperties, 'firstname.value') || '';
-  const lastName = _.get(contactProperties, 'lastname.value') || '';
-  return `${firstName} ${lastName}`
-};
-
-const isReadOnly = (property) => {
-  return property.readOnlyValue || property.calculated
-};
-
-const isMutable = (property) => {
-  return property.readOnlyDefinition
-};
-
-const getPropertyDetails = (property = {}) => {
-  return {
-    name: {label: 'Name', value: property.name},
-    label: {label: 'Label', value: property.label},
-    description: {label: 'Description', value: property.description},
-    groupName: {label: 'Group Name', value: property.groupName},
-    type: {label: 'Type', value: property.type},
-  }
-};
-
-const toCsv = (contacts, properties) => {
-  return _.map(contacts, (contact) => {
-
-    const csvContact = _.reduce(properties, (csvContact, property) => {
-      csvContact[property.label] = _.get(contact, `properties.${property.name}.value`) || '';
-      return csvContact;
-    }, {});
-
-    console.log(csvContact);
-    return csvContact
-  });
-};
-
+const getAllProperties = async () => (await hs('GET', '/crm/v3/properties/contacts')).results;
 
 const app = express();
-const hubspot = new Hubspot({apiKey: process.env.HUBSPOT_API_KEY});
 
 app.use(express.static('css'));
 app.use(express.static('html'));
-
-app.use(bodyParser.urlencoded({
-  limit: '50mb',
-  extended: true,
-}));
-
-app.use(bodyParser.json({
-  limit: '50mb',
-  extended: true,
-}));
-
+app.use(bodyParser.urlencoded({limit: '50mb', extended: true}));
+app.use(bodyParser.json({limit: '50mb', extended: true}));
 app.use(express.static('public'));
 app.set('view engine', 'pug');
 app.set('views', path.join(__dirname, 'views'));
-
 app.use(checkEnv);
 
-app.get('/', async (req, res) => {
-  res.redirect('/contacts')
-});
+app.get('/', (req, res) => res.redirect('/contacts'));
 
 app.post('/contacts', async (req, res) => {
   try {
     const email = _.get(req, 'body.email');
     if (!_.isNil(email)) {
-      const properties = _.map(req.body, (value, property) => {
-        return {property, value}
-      });
-
-      // Create or update a contact
-      // POST /contacts/v1/contact/createOrUpdate/email/:contact_email
-      // https://developers.hubspot.com/docs/methods/contacts/create_or_update
-      console.log('Calling contacts.create_or_update API method. Create new contact with email:', email);
-      const result = await hubspot.contacts.createOrUpdate(email, {properties});
-      console.log('Response from API', result);
-
-      res.redirect('/contacts');
+      const properties = _.pickBy(req.body, (v) => v !== '');
+      console.log('Creating contact with email:', email);
+      await hs('POST', '/crm/v3/objects/contacts', {properties});
     }
+    res.redirect('/contacts');
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`)
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.post('/contacts/:vid', async (req, res) => {
   try {
-    const email = _.get(req, 'body.email');
-    if (!_.isNil(email)) {
-      const properties = _.map(req.body, (value, property) => {
-        return {property, value}
-      });
-
-      // Create or update a contact
-      // POST /contacts/v1/contact/createOrUpdate/email/:contact_email
-      // https://developers.hubspot.com/docs/methods/contacts/create_or_update
-      console.log('Calling contacts.create_or_update API method. Update contact with email:', email);
-      const result = await hubspot.contacts.createOrUpdate(email, {properties});
-      console.log('Response from API', result);
-
-      res.redirect('/contacts');
-    }
+    const vid = req.params.vid;
+    console.log('Updating contact:', vid);
+    await hs('PATCH', `/crm/v3/objects/contacts/${vid}`, {properties: req.body});
+    res.redirect('/contacts');
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.get('/contacts', async (req, res) => {
   try {
     const search = _.get(req, 'query.search');
-    let contactsResponse = {contacts: []};
+    let contacts;
     if (_.isNil(search)) {
-
-      // Get all contacts
-      // GET /contacts/v1/lists/all/contacts/all
-      // https://developers.hubspot.com/docs/methods/contacts/get_contacts
-      console.log('Calling contacts.get API method. Retrieve all contacts.');
-      contactsResponse = await hubspot.contacts.get({count: CONTACTS_COUNT});
-      console.log('Response from API', contactsResponse);
-
+      console.log('Retrieving contacts');
+      const params = new URLSearchParams({limit: CONTACTS_COUNT, properties: LIST_PROPS.join(',')});
+      contacts = (await hs('GET', `/crm/v3/objects/contacts?${params}`)).results;
     } else {
-
-      // Search for contacts by email, name, or company name
-      // GET /contacts/v1/search/query
-      // https://developers.hubspot.com/docs/methods/contacts/search_contacts
-      console.log('Calling contacts.search API method. Retrieve contacts with search query:', search);
-      contactsResponse = await hubspot.contacts.search(search);
-      console.log('Response from API', contactsResponse);
-
+      console.log('Searching contacts:', search);
+      contacts = (await hs('POST', '/crm/v3/objects/contacts/search', {
+        query: search, limit: CONTACTS_COUNT, properties: LIST_PROPS,
+      })).results;
     }
-
-    res.render('contacts', { contacts: prepareContactsContent(contactsResponse.contacts), search});
+    res.render('contacts', {contacts: prepareContactsContent(contacts), search});
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.get('/contacts/new', async (req, res) => {
   try {
-    // Get All Contacts Properties
-    // GET /properties/v1/contacts/properties
-    // https://developers.hubspot.com/docs/methods/contacts/v2/get_contacts_properties
-    console.log('Calling contacts.properties.get API method. Retrieve all contacts properties');
-    const hubspotProperties = await hubspot.contacts.properties.get();
-    console.log('Response from API', hubspotProperties);
-
-    // Get List of Owners
-    // GET /owners/v2/owners/
-    // https://developers.hubspot.com/docs/methods/owners/get_owners
-    console.log('Calling hubspot.owners.get API method. Retrieve all contacts owners');
-    const owners = await hubspot.owners.get();
-    console.log('Response from API', owners);
-
-    const editableProperties = getEditableProperties(hubspotProperties);
-    const properties = getContactEditableProperties({}, editableProperties);
-
+    const hubspotProperties = await getAllProperties();
+    const owners = (await hs('GET', '/crm/v3/owners')).results;
+    const properties = getContactEditableProperties({}, getEditableProperties(hubspotProperties));
     res.render('list', {items: properties, owners, action: '/contacts'});
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
@@ -236,144 +172,97 @@ app.get('/contacts/:vid', async (req, res) => {
     const vid = _.get(req, 'params.vid');
     if (_.isNil(vid)) return res.redirect('/error?msg=Missed contact');
 
-    // Get a contact record by its vid
-    // GET /contacts/v1/contact/vid/:vid/profile
-    // https://developers.hubspot.com/docs/methods/contacts/get_contact
-    console.log('Calling contacts.getById API method. Retrieve a contacts by vid:', vid);
-    const contact = await hubspot.contacts.getById(vid);
-    console.log('Response from API', contact);
-
-    // Get All Contacts Properties
-    // GET /properties/v1/contacts/properties
-    // https://developers.hubspot.com/docs/methods/contacts/v2/get_contacts_properties
-    console.log('Calling contacts.properties.get API method. Retrieve all contacts properties');
-    const hubspotProperties = await hubspot.contacts.properties.get();
-    console.log('Response from API', hubspotProperties);
-
-    // Get List of Owners
-    // GET /owners/v2/owners/
-    // https://developers.hubspot.com/docs/methods/owners/get_owners
-    console.log('Calling hubspot.owners.get API method. Retrieve all contacts owners');
-    const owners = await hubspot.owners.get();
-    console.log('Response from API', owners);
-
-    // Get Associated Engagements
-    // GET /engagements/v1/engagements/associated/:objectType/:objectId/paged
-    // https://developers.hubspot.com/docs/methods/engagements/get_associated_engagements
-    console.log('Calling hubspot.engagements.getAssociated API method. Retrieve all contacts engagements');
-    const hubspotEngagements = await hubspot.engagements.getAssociated(CONTACT_OBJECT_TYPE, vid);
-    console.log('Response from API', hubspotEngagements);
-
+    const hubspotProperties = await getAllProperties();
     const editableProperties = getEditableProperties(hubspotProperties);
-    const properties = getContactEditableProperties(contact.properties, editableProperties);
-    const engagements = prepareEngagements(hubspotEngagements.results);
+    const propNames = _.keys(editableProperties).join(',');
+    const contact = await hs('GET', `/crm/v3/objects/contacts/${vid}?properties=${encodeURIComponent(propNames)}`);
+    const owners = (await hs('GET', '/crm/v3/owners')).results;
 
-    res.render('list', {items: properties, engagements, owners, action: `/contacts/${vid}`, engagementAction: `/contacts/${vid}/engagement`});
+    const notes = (await hs('POST', '/crm/v3/objects/notes/search', {
+      filterGroups: [{filters: [{propertyName: 'associations.contact', operator: 'EQ', value: vid}]}],
+      properties: ['hs_note_body', 'hs_timestamp'],
+      limit: 20,
+    })).results;
+    const engagements = _.map(notes, (n) => ({
+      id: n.id, type: 'NOTE', title: _.get(n, 'properties.hs_note_body') || '',
+    }));
+
+    const properties = getContactEditableProperties(contact.properties, editableProperties);
+    res.render('list', {
+      items: properties, engagements, owners,
+      action: `/contacts/${vid}`, engagementAction: `/contacts/${vid}/engagement`,
+    });
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
-app.get('/contacts/:vid/engagement', async (req, res) => {
-  try {
-    const vid = _.get(req, 'params.vid');
-    if (_.isNil(vid)) return res.redirect('/error?msg=Missed contact');
-    res.render('engagements', {vid});
-  } catch (e) {
-    console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
-  }
+app.get('/contacts/:vid/engagement', (req, res) => {
+  const vid = _.get(req, 'params.vid');
+  if (_.isNil(vid)) return res.redirect('/error?msg=Missed contact');
+  res.render('engagements', {vid});
 });
 
 app.post('/contacts/:vid/engagement', async (req, res) => {
   try {
-    const vid = _.get(req, 'params.vid');
-    let payload = _.clone(req.body);
-    payload = _.set(payload, 'metadata.startTime', toDate(_.get(payload, 'metadata.startTime')));
-    payload = _.set(payload, 'metadata.endTime', toDate(_.get(payload, 'metadata.endTime')));
-
-    // Create an Engagement
-    // POST /engagements/v1/engagements
-    // https://developers.hubspot.com/docs/methods/engagements/create_engagement
-    console.log('Calling hubspot.engagements.create API method. Create contact engagement');
-    const result = await hubspot.engagements.create(payload);
-    console.log('Response from API', result);
-
+    const vid = req.params.vid;
+    const title = _.get(req.body, 'metadata.title') || '';
+    const body = _.get(req.body, 'metadata.body') || '';
+    const noteBody = [title, body].filter(Boolean).join(' - ') || 'Note';
+    await hs('POST', '/crm/v3/objects/notes', {
+      properties: {hs_timestamp: new Date().toISOString(), hs_note_body: noteBody},
+      associations: [{
+        to: {id: vid},
+        types: [{associationCategory: 'HUBSPOT_DEFINED', associationTypeId: NOTE_TO_CONTACT}],
+      }],
+    });
     res.redirect(`/contacts/${vid}`);
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.get('/properties', async (req, res) => {
   try {
-    // Get All Contacts Properties
-    // GET /properties/v1/contacts/properties
-    // https://developers.hubspot.com/docs/methods/contacts/v2/get_contacts_properties
-    console.log('Calling contacts.properties.get API method. Retrieve all contacts properties');
-    const properties = await hubspot.contacts.properties.get();
-    console.log('Response from API', properties);
-
-    const mutableProperties = getMutableProperties(properties);
-
-    res.render('properties', {properties: mutableProperties});
+    const properties = await getAllProperties();
+    res.render('properties', {properties: getMutableProperties(properties)});
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.post('/properties', async (req, res) => {
   try {
-
-    // Create a contact property
-    // POST /properties/v1/contacts/properties
-    // https://developers.hubspot.com/docs/methods/contacts/v2/create_contacts_property
-    console.log('Calling contacts.properties.create API method. Create contact property');
-    const result = await hubspot.contacts.properties.create(req.body);
-    console.log('Response from API', result);
-
+    const body = {...req.body};
+    body.fieldType = body.fieldType || FIELD_TYPES[body.type] || 'text';
+    await hs('POST', '/crm/v3/properties/contacts', body);
     res.redirect('/properties');
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.post('/properties/:name', async (req, res) => {
   try {
-    const name = _.get(req, 'params.name');
-
-    // Update a contact property
-    // PUT /properties/v1/contacts/properties/named/:property_name
-    // https://developers.hubspot.com/docs/methods/contacts/v2/update_contact_property
-    console.log('Calling contacts.properties.update API method. Update contact property, with name:', name);
-    const result = await hubspot.contacts.properties.update(name, req.body);
-    console.log('Response from API', result);
-
-    res.redirect('/properties')
+    await hs('PATCH', `/crm/v3/properties/contacts/${req.params.name}`, req.body);
+    res.redirect('/properties');
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.get('/properties/new', async (req, res) => {
   try {
-
-    // Get Contact Property Groups
-    // GET /properties/v1/contacts/groups
-    // https://developers.hubspot.com/docs/methods/contacts/v2/get_contact_property_groups
-    console.log('Calling hubspot.contacts.properties.getGroups API method. Retrieve all contact property groups');
-    const groups = await hubspot.contacts.properties.getGroups();
-    console.log('Response from API', groups);
-
+    const groups = (await hs('GET', '/crm/v3/properties/contacts/groups')).results;
     res.render('list', {items: getPropertyDetails(), action: '/properties', groups});
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
@@ -381,62 +270,31 @@ app.get('/properties/:name', async (req, res) => {
   try {
     const name = _.get(req, 'params.name');
     if (_.isNil(name)) return res.redirect('/error?msg=Missed property');
-
-    // Get All Contacts Properties
-    // GET /properties/v1/contacts/properties
-    // https://developers.hubspot.com/docs/methods/contacts/v2/get_contacts_properties
-    console.log('Calling contacts.properties.get API method. Retrieve all contacts properties');
-    const hubspotProperties = await hubspot.contacts.properties.get();
-    console.log('Response from API', hubspotProperties);
-
-    // Get Contact Property Groups
-    // GET /properties/v1/contacts/groups
-    // https://developers.hubspot.com/docs/methods/contacts/v2/get_contact_property_groups
-    console.log('Calling hubspot.contacts.properties.getGroups API method. Retrieve all contact property groups');
-    const groups = await hubspot.contacts.properties.getGroups();
-    console.log('Response from API', groups);
-
+    const hubspotProperties = await getAllProperties();
+    const groups = (await hs('GET', '/crm/v3/properties/contacts/groups')).results;
     const property = _.find(hubspotProperties, {name});
-    const properties = getPropertyDetails(property);
-    res.render('list', {items: properties, action:  `/properties/${name}`, groups});
+    res.render('list', {items: getPropertyDetails(property), action: `/properties/${name}`, groups});
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 app.get('/export', async (req, res) => {
-
   try {
-
-    // Get All Contacts Properties
-    // GET /properties/v1/contacts/properties
-    // https://developers.hubspot.com/docs/methods/contacts/v2/get_contacts_properties
-    console.log('Calling contacts.properties.get API method. Retrieve all contacts properties');
-    const properties = await hubspot.contacts.properties.get();
-    console.log('Response from API', properties);
-
-    // Get all contacts
-    // GET /contacts/v1/lists/all/contacts/all
-    // https://developers.hubspot.com/docs/methods/contacts/get_contacts
-    console.log('Calling contacts.get API method. Retrieve all contacts.');
-    const contactsResponse = await hubspot.contacts.get({count: CONTACTS_COUNT});
-    console.log('Response from API', contactsResponse);
-    const csvContent = toCsv(contactsResponse.contacts, properties);
-
-    res.csv(csvContent, true, {'Content-disposition': 'attachment; filename=contacts.csv'});
+    const properties = _.reject(await getAllProperties(), 'hidden');
+    const contacts = (await hs('POST', '/crm/v3/objects/contacts/search', {
+      limit: CONTACTS_COUNT, properties: _.map(properties, 'name'),
+    })).results;
+    res.csv(toCsv(contacts, properties), true, {'Content-disposition': 'attachment; filename=contacts.csv'});
   } catch (e) {
     console.error(e);
-    res.redirect(`/error?msg=${e.message}`);
+    res.redirect(`/error?msg=${encodeURIComponent(e.message)}`);
   }
 });
 
-app.get('/error', (req, res) => {
-  res.render('error', {error: req.query.msg});
-});
+app.get('/error', (req, res) => res.render('error', {error: req.query.msg}));
 
-app.use((error, req, res, next) => {
-  res.render('error', {error: error.message});
-});
+app.use((error, req, res, next) => res.render('error', {error: error.message}));
 
 app.listen(PORT, () => console.log(`Listening on http://localhost:${PORT}`));
