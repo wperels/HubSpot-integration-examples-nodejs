@@ -1,21 +1,21 @@
 {
-  "name": "hubspot-contacts",
+  "name": "contact-quality-demo",
   "version": "1.0.0",
   "engines": {
-    "node": ">= 10.13.0"
+    "node": ">=18"
   },
-  "description": "hubspot-node client sample applications",
-  "main": "index.js",
+  "description": "Contact quality gatekeeper demo for the HubSpot CRM Contacts API",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "keywords": [
     "hubspot",
     "contacts",
-    "sample",
-    "example"
+    "data-quality",
+    "demo"
   ],
-  "author": "hubspot",
+  "author": "wperelstein",
   "license": "Apache-2.0",
   "dependencies": {
     "@hubspot/api-client": "^14.0.1",

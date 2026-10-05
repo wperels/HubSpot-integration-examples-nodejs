@@ -10,7 +10,7 @@ if (!process.env.HUBSPOT_API_KEY) {
 
 const app = express();
 const client = new hubspot.Client({ accessToken: process.env.HUBSPOT_API_KEY });
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
