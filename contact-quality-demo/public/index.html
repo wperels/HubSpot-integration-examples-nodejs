@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Contact Quality Gatekeeper</title>
+  <link rel="icon" href="favicon-32x32.webp">
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #33475b; }
+    h1 { margin-bottom: .25rem; }
+    textarea { width: 100%; height: 170px; font-family: monospace; padding: .5rem; box-sizing: border-box; }
+    button { background: #ff7a59; color: #fff; border: 0; padding: .6rem 1.2rem; border-radius: 4px; font-size: 1rem; cursor: pointer; margin: .5rem .5rem .5rem 0; }
+    button:disabled { background: #cbd6e2; cursor: not-allowed; }
+    button.secondary { background: #516f90; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { text-align: left; padding: .5rem; border-bottom: 1px solid #dfe3eb; font-size: .9rem; }
+    .badge { padding: .15rem .5rem; border-radius: 10px; font-size: .8rem; font-weight: 600; }
+    .ready { background: #d5f5e3; color: #1e7b45; }
+    .already-exists { background: #fdebd0; color: #b9770e; }
+    .duplicate-upload { background: #fdebd0; color: #b9770e; }
+    .needs-correction { background: #fadbd8; color: #b03a2e; }
+    .check-error { background: #fadbd8; color: #b03a2e; }
+    #summary, #outcome { margin-top: 1rem; font-weight: 600; }
+    .hint { color: #7c98b6; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>Contact Quality Gatekeeper</h1>
+  <p class="hint">Paste contacts as CSV: firstname,lastname,email,phone. Check them, then create only the clean ones.</p>
+
+  <textarea id="input">firstname,lastname,email,phone
+jane,DOE,Jane.Doe@Example.com,7195550123
+JOHN,o'brien,john.obrien@example.com,(303) 555-0188
+sam,lee,sam.lee@example,3035550199
+jane,doe,jane.doe@example.com,7195550123
+test,three,testing@test3.com,
+,,,</textarea>
+
+  <button id="checkBtn">1. Check contacts</button>
+  <button id="createBtn" class="secondary" disabled>2. Create ready contacts in HubSpot</button>
+
+  <div id="summary"></div>
+  <table id="results" hidden>
+    <thead>
+      <tr><th>Row</th><th>Cleaned name</th><th>Email</th><th>Phone</th><th>Status</th><th>Message</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <div id="outcome"></div>
+
+  <script>
+    const input = document.getElementById('input');
+    const checkBtn = document.getElementById('checkBtn');
+    const createBtn = document.getElementById('createBtn');
+    const summaryEl = document.getElementById('summary');
+    const outcomeEl = document.getElementById('outcome');
+    const table = document.getElementById('results');
+    const tbody = table.querySelector('tbody');
+    let readyContacts = [];
+
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    function parseCsv(text) {
+      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      if (!lines.length) return [];
+      const first = lines[0].toLowerCase();
+      const hasHeader = first.includes('email');
+      const body = hasHeader ? lines.slice(1) : lines;
+      return body
+        .map((line) => line.split(',').map((p) => p.trim()))
+        .filter((p) => p.some(Boolean))
+        .map(([firstname = '', lastname = '', email = '', phone = '']) =>
+          ({ firstname, lastname, email, phone }));
+    }
+
+    async function postJson(url, body) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      return res.json();
+    }
+
+    checkBtn.addEventListener('click', async () => {
+      outcomeEl.textContent = '';
+      createBtn.disabled = true;
+      checkBtn.disabled = true;
+      checkBtn.textContent = 'Checking...';
+      try {
+        const records = parseCsv(input.value);
+        const data = await postJson('/api/check', { records });
+
+        tbody.innerHTML = data.results.map((r) => `
+          <tr>
+            <td>${r.row}</td>
+            <td>${esc(r.name)}</td>
+            <td>${esc(r.cleaned.email)}</td>
+            <td>${esc(r.cleaned.phone)}</td>
+            <td><span class="badge ${esc(r.status)}">${esc(r.status)}</span></td>
+            <td>${esc(r.message)}</td>
+          </tr>`).join('');
+        table.hidden = false;
+
+        summaryEl.textContent = Object.entries(data.summary)
+          .map(([status, n]) => `${status}: ${n}`).join('   |   ');
+
+        readyContacts = data.results.filter((r) => r.status === 'ready').map((r) => r.cleaned);
+        createBtn.disabled = readyContacts.length === 0;
+        createBtn.textContent = `2. Create ${readyContacts.length} ready contact(s) in HubSpot`;
+      } catch (err) {
+        summaryEl.textContent = `Error: ${err.message}`;
+      } finally {
+        checkBtn.disabled = false;
+        checkBtn.textContent = '1. Check contacts';
+      }
+    });
+
+    createBtn.addEventListener('click', async () => {
+      createBtn.disabled = true;
+      outcomeEl.textContent = 'Creating...';
+      try {
+        const data = await postJson('/api/create', { contacts: readyContacts });
+        let msg = `Created ${data.created.length} contact(s) in HubSpot.`;
+        if (data.errors.length) {
+          msg += ` ${data.errors.length} failed: ` +
+            data.errors.map((e) => `${e.email} (${e.message})`).join('; ');
+        }
+        outcomeEl.textContent = msg;
+        readyContacts = [];
+      } catch (err) {
+        outcomeEl.textContent = `Error: ${err.message}`;
+      }
+    });
+  </script>
+</body>
+</html>
