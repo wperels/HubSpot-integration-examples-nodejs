@@ -9,8 +9,8 @@ const object = process.argv[2] || 'contacts';
 const csvCell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`;
 
 (async () => {
-  const res = await fetch(`https://api.hubapi.com/crm/v3/properties/${object}`, {
-    headers: { Authorization: `Bearer ${process.env.HUBSPOT_API_KEY}` },
+  const res = await fetch(`https://api.hubapi.com/crm/properties/2026-03/${object}`, {
+    headers: { Authorization: `Bearer ${process.env.HUBSPOT_SERVICE_KEY}` },
   });
   const data = await res.json();
 

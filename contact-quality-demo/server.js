@@ -4,12 +4,12 @@ const path = require('path');
 const express = require('express');
 const hubspot = require('@hubspot/api-client');
 
-if (!process.env.HUBSPOT_API_KEY) {
-  throw new Error('HUBSPOT_API_KEY is missing. Add it to your .env file.');
+if (!process.env.HUBSPOT_SERVICE_KEY) {
+  throw new Error('HUBSPOT_SERVICE_KEY is missing. Add it to your .env file.');
 }
 
 const app = express();
-const client = new hubspot.Client({ accessToken: process.env.HUBSPOT_API_KEY });
+const client = new hubspot.Client({ accessToken: process.env.HUBSPOT_SERVICE_KEY });
 const PORT = process.env.PORT || 3001;
 
 app.use(express.json());
@@ -43,26 +43,66 @@ function validEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
 }
 
-async function findContactByEmail(email) {
+async function findExistingContacts(contact) {
+  const filterGroups = [
+    { filters: [{ propertyName: 'email', operator: 'EQ', value: contact.email }] },
+    { filters: [{ propertyName: 'hs_additional_emails', operator: 'EQ', value: contact.email }] },
+  ];
+
+  if (contact.firstname && contact.lastname) {
+    filterGroups.push({
+      filters: [
+        { propertyName: 'firstname', operator: 'EQ', value: contact.firstname },
+        { propertyName: 'lastname', operator: 'EQ', value: contact.lastname },
+      ],
+    });
+  }
+
   const response = await client.crm.contacts.searchApi.doSearch({
-    filterGroups: [
-      {
-        filters: [
-          {
-            propertyName: 'email',
-            operator: 'EQ',
-            value: email,
-          },
-        ],
-      },
-    ],
-    properties: ['email', 'firstname', 'lastname'],
-    limit: 1,
+    filterGroups,
+    properties: ['email', 'hs_additional_emails', 'firstname', 'lastname', 'phone'],
+    limit: 10,
     after: 0,
     sorts: [],
   });
 
-  return response.results[0] || null;
+  return response.results;
+}
+
+function digitsOnly(value = '') {
+  return String(value).replace(/\D/g, '');
+}
+
+function classifyMatch(contact, results) {
+  const byEmail = results.find(
+    (r) => (r.properties.email || '').toLowerCase() === contact.email
+  );
+  if (byEmail) return { type: 'email', record: byEmail };
+
+  const bySecondaryEmail = results.find((r) =>
+    (r.properties.hs_additional_emails || '')
+      .split(';')
+      .map((e) => e.trim().toLowerCase())
+      .includes(contact.email)
+  );
+  if (bySecondaryEmail) return { type: 'secondary email', record: bySecondaryEmail };
+
+  const phone = digitsOnly(contact.phone);
+  const byNamePhone = phone && results.find(
+    (r) => digitsOnly(r.properties.phone) === phone
+  );
+  if (byNamePhone) return { type: 'name+phone', record: byNamePhone };
+
+  if (results.length) return { type: 'name', record: results[0] };
+  return null;
+}
+
+function parseConflict(error) {
+  const status = error.code ?? error.statusCode ?? error.response?.status;
+  if (status !== 409) return null;
+  const body = typeof error.body === 'string' ? error.body : JSON.stringify(error.body || {});
+  const match = body.match(/Existing ID:\s*(\d+)/i);
+  return { id: match ? match[1] : null };
 }
 
 app.post('/api/check', async (req, res) => {
@@ -98,12 +138,20 @@ app.post('/api/check', async (req, res) => {
       seenEmails.add(contact.email);
 
       try {
-        const existing = await findContactByEmail(contact.email);
+        const found = await findExistingContacts(contact);
+        const match = classifyMatch(contact, found);
 
-        if (existing) {
+        if (match && (match.type === 'email' || match.type === 'secondary email')) {
           result.status = 'already-exists';
-          result.message = 'A matching contact already exists in HubSpot.';
-          result.hubspotId = existing.id;
+          result.message =
+            match.type === 'email'
+              ? 'A contact with this email already exists in HubSpot.'
+              : 'This email is a secondary email on an existing HubSpot contact.';
+          result.hubspotId = match.record.id;
+        } else if (match) {
+          result.status = 'possible-duplicate';
+          result.message = `Possible duplicate (matched on ${match.type}).`;
+          result.hubspotId = match.record.id;
         } else {
           result.status = 'ready';
           result.message = 'Clean, valid, and not found in HubSpot.';
@@ -132,6 +180,7 @@ app.post('/api/check', async (req, res) => {
 app.post('/api/create', async (req, res) => {
   const contacts = Array.isArray(req.body.contacts) ? req.body.contacts : [];
   const created = [];
+  const existing = [];
   const errors = [];
 
   for (const contact of contacts) {
@@ -150,6 +199,12 @@ app.post('/api/create', async (req, res) => {
         id: createdContact.id,
       });
     } catch (error) {
+      const conflict = parseConflict(error);
+      if (conflict) {
+        existing.push({ email: contact.email, id: conflict.id });
+        continue;
+      }
+
       console.error(`HubSpot create error for ${contact.email}:`, error.body || error.message);
       errors.push({
         email: contact.email,
@@ -158,7 +213,7 @@ app.post('/api/create', async (req, res) => {
     }
   }
 
-  res.json({ created, errors });
+  res.json({ created, existing, errors });
 });
 
 app.listen(PORT, () => {
